@@ -36,6 +36,10 @@ class WebhookNotification(Event):
     def __init__(self, /, **blob): ...
 
 
+class ProtocolPauseSignal(Event):
+    def __init__(self, /, **blob): ...
+
+
 class HackDetection(gl.Contract):
     """
     Intelligent Contract for Hack Detection and Emergency Pause
@@ -75,6 +79,11 @@ class HackDetection(gl.Contract):
     notifications: TreeMap[Address, DynArray[str]]
     last_pattern_fetch: str
     last_pattern_added: str
+    protected_protocols: TreeMap[Address, bool]
+    protocol_pause_flags: TreeMap[Address, bool]
+    protocol_pause_reasons: TreeMap[Address, str]
+    protocol_pause_tx: TreeMap[Address, str]
+    protocol_list: DynArray[Address]
 
 
 
@@ -137,6 +146,30 @@ class HackDetection(gl.Contract):
         self.last_pattern_added = ""
         self.recent_index = u256(0)
 
+    def _emit_protocol_pause_signal(self, protocol: Address, reason: str, tx_hash: str, risk_score: int):
+        payload = json.dumps({
+            "protocol": str(protocol),
+            "pause": True,
+            "reason": reason,
+            "tx_hash": tx_hash,
+            "risk_score": int(risk_score),
+        })
+        ProtocolPauseSignal(message=payload)
+
+    def _set_protocol_pause(self, protocol: Address, reason: str, tx_hash: str, risk_score: int):
+        protocol_addr = self._to_address(protocol)
+        if not self.protected_protocols.get(protocol_addr, False):
+            return
+        self.protocol_pause_flags[protocol_addr] = True
+        self.protocol_pause_reasons[protocol_addr] = reason
+        self.protocol_pause_tx[protocol_addr] = tx_hash
+        self._emit_protocol_pause_signal(protocol_addr, reason, tx_hash, risk_score)
+
+    def _signal_all_protocol_pauses(self, reason: str, tx_hash: str, risk_score: int):
+        for protocol in self.protocol_list:
+            if self.protected_protocols.get(protocol, False):
+                self._set_protocol_pause(protocol, reason, tx_hash, risk_score)
+
     def _to_address(self, value):
         if isinstance(value, Address):
             return value
@@ -148,18 +181,18 @@ class HackDetection(gl.Contract):
         # Accept hex strings from deployment UIs
         return Address(value)
 
-    def _get_timestamp(self) -> u256:
+    def _get_timestamp(self) -> int:
         # Try common runtime timestamp sources; fall back to 0 to avoid hard failure
         blk = getattr(gl, "block", None)
         if blk is not None and hasattr(blk, "timestamp"):
-            return u256(blk.timestamp)
+            return int(blk.timestamp)
         msg = getattr(gl, "message", None)
         if msg is not None and hasattr(msg, "timestamp"):
-            return u256(msg.timestamp)
+            return int(msg.timestamp)
         ts = getattr(gl, "timestamp", None)
         if ts is not None:
-            return u256(ts)
-        return u256(0)
+            return int(ts)
+        return 0
 
     def _nondet_bool_token(self, prompt: str) -> str:
         # Return only TRUE or FALSE to stabilize validator outcomes
@@ -321,6 +354,11 @@ OUTPUT: TRUE or FALSE"""
         self.circuit_breaker_triggered = True
         self.is_paused = True
         self.blacklisted[sender] = True
+        self._signal_all_protocol_pauses(
+            "Global circuit breaker triggered by hack detection",
+            tx_hash,
+            risk_score
+        )
         self._record_event("circuit_breaker", tx_hash, risk_score, f"Sender {sender} blacklisted and contract paused", sender)
         self._notify(sender, f"Emergency: You have been blacklisted and contract paused due to suspicious tx {tx_hash}")
         self._notify(self.admin, f"Emergency: Contract paused and user {sender} blacklisted due to tx {tx_hash}")
@@ -336,7 +374,7 @@ OUTPUT: TRUE or FALSE"""
         if contract_addr is None:
             contract_addr = "0x0000000000000000000000000000000000000000"
         evt = SecurityEvent(
-            timestamp=self._get_timestamp(),
+            timestamp=u256(self._get_timestamp()),
             event_type=event_type,
             details=details,
             tx_hash=tx_hash,
@@ -407,6 +445,52 @@ OUTPUT: TRUE or FALSE"""
         self.notify_level_min = u8(notify_level_min)
         self.auto_pause_level_min = u8(auto_pause_level_min)
 
+    @gl.public.write
+    def register_protocol(self, protocol: Address):
+        self._require_role(self.ADMIN_ROLE)
+        protocol_addr = self._to_address(protocol)
+        if not self.protected_protocols.get(protocol_addr, False):
+            self.protected_protocols[protocol_addr] = True
+            self.protocol_pause_flags[protocol_addr] = False
+            self.protocol_pause_reasons[protocol_addr] = ""
+            self.protocol_pause_tx[protocol_addr] = ""
+            self.protocol_list.append(protocol_addr)
+            self._record_event("protocol_registered", "", 0, f"Protocol registered: {protocol_addr}", self.admin)
+            self._emit_webhook(self.admin, f"Protocol registered: {protocol_addr}", "protocol_registered", "")
+
+    @gl.public.write
+    def unregister_protocol(self, protocol: Address):
+        self._require_role(self.ADMIN_ROLE)
+        protocol_addr = self._to_address(protocol)
+        self.protected_protocols[protocol_addr] = False
+        self.protocol_pause_flags[protocol_addr] = False
+        self.protocol_pause_reasons[protocol_addr] = ""
+        self.protocol_pause_tx[protocol_addr] = ""
+        self._record_event("protocol_unregistered", "", 0, f"Protocol unregistered: {protocol_addr}", self.admin)
+        self._emit_webhook(self.admin, f"Protocol unregistered: {protocol_addr}", "protocol_unregistered", "")
+
+    @gl.public.write
+    def pause_protocol(self, protocol: Address, reason: str, tx_hash: str = "", risk_score: int = 100):
+        self._require_role(self.ADMIN_ROLE)
+        protocol_addr = self._to_address(protocol)
+        if not self.protected_protocols.get(protocol_addr, False):
+            raise UserError("Protocol not registered")
+        # Write state directly so write intent is explicit for linters and auditors.
+        self.protocol_pause_flags[protocol_addr] = True
+        self.protocol_pause_reasons[protocol_addr] = reason
+        self.protocol_pause_tx[protocol_addr] = tx_hash
+        self._emit_protocol_pause_signal(protocol_addr, reason, tx_hash, risk_score)
+        self._record_event("protocol_paused", tx_hash, risk_score, f"Protocol paused: {protocol_addr} reason={reason}", self.admin)
+
+    @gl.public.write
+    def clear_protocol_pause(self, protocol: Address):
+        self._require_role(self.ADMIN_ROLE)
+        protocol_addr = self._to_address(protocol)
+        self.protocol_pause_flags[protocol_addr] = False
+        self.protocol_pause_reasons[protocol_addr] = ""
+        self.protocol_pause_tx[protocol_addr] = ""
+        self._record_event("protocol_pause_cleared", "", 0, f"Protocol pause cleared: {protocol_addr}", self.admin)
+
     @gl.public.view
     def get_thresholds(self) -> str:
         return json.dumps({
@@ -443,6 +527,28 @@ OUTPUT: TRUE or FALSE"""
     @gl.public.view
     def get_paused(self) -> bool:
         return self.is_paused
+
+    @gl.public.view
+    def is_protocol_registered(self, protocol: Address) -> bool:
+        protocol_addr = self._to_address(protocol)
+        return self.protected_protocols.get(protocol_addr, False)
+
+    @gl.public.view
+    def should_pause_protocol(self, protocol: Address) -> bool:
+        protocol_addr = self._to_address(protocol)
+        return self.protected_protocols.get(protocol_addr, False) and (
+            self.is_paused or self.protocol_pause_flags.get(protocol_addr, False)
+        )
+
+    @gl.public.view
+    def get_protocol_pause_status(self, protocol: Address) -> str:
+        protocol_addr = self._to_address(protocol)
+        return json.dumps({
+            "registered": self.protected_protocols.get(protocol_addr, False),
+            "paused": self.should_pause_protocol(protocol_addr),
+            "reason": self.protocol_pause_reasons.get(protocol_addr, ""),
+            "tx_hash": self.protocol_pause_tx.get(protocol_addr, "")
+        })
 
     @gl.public.view
     def get_risk_score(self, tx_hash: str) -> int:

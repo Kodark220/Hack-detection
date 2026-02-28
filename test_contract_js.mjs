@@ -4,7 +4,7 @@ import { TransactionStatus } from 'genlayer-js/types';
 
 const RPC_URL = process.env.GENLAYER_RPC_URL || 'https://studio.genlayer.com/api';
 const CONTRACT_ADDRESS =
-  process.env.GENLAYER_CONTRACT || '0xcD117b260D9623587B11acD5ed99Bb12109d2372';
+  process.env.GENLAYER_CONTRACT || '0x57a3212cbca238455291ad8ca2CA51F4D269Ae6F';
 const PRIVATE_KEY = process.env.GENLAYER_PRIVATE_KEY || '';
 
 if (!PRIVATE_KEY) {

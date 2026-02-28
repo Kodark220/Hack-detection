@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Tuple
 
 
 RPC_URL = "https://studio.genlayer.com/api"
-CONTRACT_ADDRESS = "0xcD117b260D9623587B11acD5ed99Bb12109d2372"
+CONTRACT_ADDRESS = "0x57a3212cbca238455291ad8ca2CA51F4D269Ae6F"
 
 # RPC method: use "gen_sendTransaction" if your RPC supports it.
 # If unsure, start with "gen_call" (won't persist on-chain).
